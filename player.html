@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="generator" content="mugal">
-<meta name="mugal-template" content="2026.10.30">
+<meta name="mugal-template" content="2026.11.25">
 <meta name="color-scheme" content="dark">
 <title>Music</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%227%22 fill=%22%23111318%22/%3E%3Ctext x=%2216%22 y=%2224%22 font-size=%2222%22 text-anchor=%22middle%22 fill=%22%23C8873A%22%3E%E2%99%AB%3C/text%3E%3C/svg%3E">
@@ -23,6 +23,12 @@
   /* virtual list row heights: every row of a kind has exactly this height */
   --row-h:2.3rem; --hdr-h:3.6rem; --sec-h:2.5rem;
   --fav-w:1.8rem;
+}
+:root[data-theme="light"]{
+  --bg:#F5F3EE; --bg2:#EBE8E0; --bg3:#DFDBD1; --panel:#FAF8F4; --border:#C9C4B8;
+  --text:#1E1B17; --text2:#5A544C; --text3:#8B8479;
+  --accent:#9C5E18; --playing:#1E8F52; --danger:#B53737;
+  --hover:rgba(156,94,24,.09); --sel:rgba(156,94,24,.16);
 }
 html{font-size:14px} /* overridden by the font-size setting; all sizes are rem-based */
 html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.4}
@@ -287,6 +293,9 @@ input[type=range]:disabled{opacity:.35;cursor:not-allowed}
     <div class="sp-row"><span>432 Hz tuning</span><button class="sp-btn" id="sp-tune">Off</button></div>
     <p class="sp-note">Retunes A4 = 440 Hz recordings to 432 Hz: pitch −31.8 cents, tempo −1.8%.</p>
     <h3>Display</h3>
+    <div class="sp-row"><span>Theme</span>
+      <button class="sp-btn" id="btn-theme" aria-label="Toggle light or dark theme">Dark</button>
+    </div>
     <div class="sp-row"><span>Font size</span>
       <span class="sp-stepper"><button class="sp-btn" id="fs-minus" aria-label="Smaller">−</button><span id="fs-val">14px</span><button class="sp-btn" id="fs-plus" aria-label="Larger">+</button></span>
     </div>
@@ -358,7 +367,10 @@ input[type=range]:disabled{opacity:.35;cursor:not-allowed}
 "use strict";
 // ═══════════════════════════════════════════════════════════════════════════
 // MUSIC PLAYER (mugal) — file:// first, zero dependencies
-//   Data: window.__AUDIO_DATA (schema 2, see mugal.py build_payload).
+//   Data: window.__AUDIO_DATA (schema 2, see mugal.py build_payload). Either one whole
+//         `tracks` array, or a manifest + `chunks` (folder-aligned slices written by
+//         .mugal/split-data.py) that are loaded on demand: the first screen only reads
+//         the chunk of the folder it opens, the rest streams in afterwards.
 //   Bump <meta name="mugal-template"> (YYYY.MM.DD) on every change: mugal.py --self-update compares it.
 //   Track identity is its path: indices are runtime-only, paths survive rescans.
 //   URL hash = what you're looking at (#/folder?q=…&t=track); localStorage = queue, favorites, prefs.
@@ -378,7 +390,13 @@ const TUNE_RATE = 432 / 440;
 const QUEUE_SHOW = 1000;              // context rows listed in the queue view
 
 const $ = id => document.getElementById(id);
-const audio = $("audio"), scroller = $("tracklist"), searchEl = $("search"), treeEl = $("tree");
+// Two audio elements, used alternately: the idle one buffers the track that is coming next,
+// so a track change only has to start playback instead of opening a (possibly cold) file.
+const EL_A = $("audio"), EL_B = new Audio();
+EL_A.preload = EL_B.preload = "metadata";
+let audio = EL_A;                           // the element that is actually playing
+const spare = () => (audio === EL_A ? EL_B : EL_A);
+const scroller = $("tracklist"), searchEl = $("search"), treeEl = $("tree");
 const rowsEl = $("vl-rows"), headerEl = $("tracklist-header"), emptyEl = $("empty"), ctxEl = $("ctxmenu");
 const scrubber = $("scrubber"), volEl = $("vol");
 
@@ -401,6 +419,10 @@ const absURL = u => new URL(u, location.href).href;
 const fold = s => String(s).normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
 const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const stem = f => { const i = f.lastIndexOf("."); return i > 0 ? f.slice(0, i) : f; };
+// Display-side name repair: folder names and file names must stay byte-exact for the
+// audio URLs, so fixes for their mojibake live in a lookup table shipped with the data.
+const nf = s => (FIX && Object.prototype.hasOwnProperty.call(FIX, s)) ? FIX[s] : s;
+const prettyPath = p => String(p).split("/").map(nf).join("/");
 const range = (a, b) => { const r = new Int32Array(Math.max(0, b - a)); for (let i = 0; i < r.length; i++) r[i] = a + i; return r; };
 const typing = el => !!el && (el.isContentEditable || el.tagName === "TEXTAREA" || el.tagName === "SELECT"
   || (el.tagName === "INPUT" && !["range", "checkbox", "radio", "button", "file"].includes(el.type)));
@@ -427,30 +449,87 @@ function hideToast() { $("toast").classList.remove("show"); }
 
 // ── Library ───────────────────────────────────────────────────────────────
 let T = [], FOLDERS = [], FOLDER_ART = [], BASE = "", ROOT = "", LIB = "", META = {};
+let FIX = null;                                      // garbled-name → repaired text (display only)
 const BY_PATH = new Map();
 let NODES = [], FNODE = [], ROOTNODE = null;
 const NODE_BY_PATH = new Map();
 let HAY = null;                                     // folded search text per track, built on first search
+let STRINGS = [], CHUNKS = null, FCOUNT = null;      // chunked data (split-data.py): see the loader below
+const CHUNK_DONE = [], CHUNK_WAIT = new Map();
 
 function decode(raw) {
-  const S = raw.strings, F = raw.folders, rows = raw.tracks;
+  const S = raw.strings, F = raw.folders;
   FOLDERS = F;
+  STRINGS = S;
+  FIX = raw.fix || null;                             // folder/file names are kept byte-exact (they build the audio URLs)
   BASE = raw.base ? (isAbs(raw.base) ? raw.base : encPath(raw.base)) : "";
   ROOT = String(raw.root || "");
   FOLDER_ART = raw.art.map(si => { const h = S[si]; return h ? (isAbs(h) ? h : encPath(h)) : null; });
-  T = new Array(rows.length);
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i], folder = F[r[0]] ?? "", file = String(r[1]);
-    const path = folder ? `${folder}/${file}` : file;
-    T[i] = { i, fi: r[0], file, path, title: r[2] || stem(file), artist: S[r[3]] || "", album: S[r[4]] || "",
-             albumArtist: S[r[5]] || "", track: r[6] | 0, disc: r[7] | 0, year: r[8] | 0, genre: S[r[9]] || "", dur: +r[10] || 0 };
-    BY_PATH.set(path, i);
-  }
+  // Tracks may arrive as one big array (mugal.py) or split into folder-aligned chunks (split-data.py).
+  // With chunks, T only holds the ranges that are loaded so far; T.length is always the full count.
+  CHUNKS = Array.isArray(raw.chunks) && raw.chunks.length ? raw.chunks : null;
+  const rows = raw.tracks;
+  const n = raw.count != null ? raw.count : (rows ? rows.length : 0);
+  FCOUNT = Array.isArray(raw.fcount) && raw.fcount.length === F.length ? raw.fcount
+    : (() => { const c = new Array(F.length).fill(0); if (rows) for (const r of rows) c[r[0]]++; return c; })();
+  T = new Array(n);
+  if (!CHUNKS && rows) materialize(rows, 0);
   let h = 0x811c9dc5;                               // FNV-1a of the library root → storage namespace
   for (const c of ROOT) h = Math.imul(h ^ c.codePointAt(0), 16777619) >>> 0;
   LIB = h.toString(36);
-  META = { version: raw.version, generated: raw.generated, count: rows.length };
+  META = { version: raw.version, generated: raw.generated, count: n };
 }
+function materialize(rows, a) {
+  const S = STRINGS, F = FOLDERS;
+  for (let k = 0; k < rows.length; k++) {
+    const i = a + k, r = rows[k], folder = F[r[0]] ?? "", file = String(r[1]);
+    const path = folder ? `${folder}/${file}` : file;
+    T[i] = { i, fi: r[0], file, path, title: nf(r[2] || stem(file)), artist: nf(S[r[3]]) || "", album: nf(S[r[4]]) || "",
+             albumArtist: nf(S[r[5]]) || "", track: r[6] | 0, disc: r[7] | 0, year: r[8] | 0, genre: nf(S[r[9]]) || "", dur: +r[10] || 0 };
+    BY_PATH.set(path, i);
+  }
+}
+// ── Chunk loader ──────────────────────────────────────────────────────────
+// Each chunk is a plain <script>; loading it fills its range of T. Everything that
+// needs a range waits on ensureRange(), so the first screen only reads its own chunk.
+function chunkOf(i) {
+  if (!CHUNKS) return -1;
+  let lo = 0, hi = CHUNKS.length - 1;
+  while (lo <= hi) { const m = (lo + hi) >> 1; const c = CHUNKS[m]; if (i < c.a) hi = m - 1; else if (i >= c.b) lo = m + 1; else return m; }
+  return -1;
+}
+function loadChunk(k) {
+  if (!CHUNKS || CHUNK_DONE[k]) return Promise.resolve();
+  if (CHUNK_WAIT.has(k)) return CHUNK_WAIT.get(k);
+  const p = new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = CHUNKS[k].f; s.async = true;
+    s.onload = () => {
+      const rows = (window.__AUDIO_CHUNKS || [])[k];
+      if (!rows) { CHUNK_WAIT.delete(k); return rej(new Error(CHUNKS[k].f)); }
+      CHUNK_WAIT.delete(k); CHUNK_DONE[k] = 1;
+      window.__AUDIO_CHUNKS[k] = null;
+      materialize(rows, CHUNKS[k].a);
+      res();
+    };
+    s.onerror = () => { CHUNK_WAIT.delete(k); rej(new Error(CHUNKS[k].f)); };
+    document.head.appendChild(s);
+  });
+  CHUNK_WAIT.set(k, p);
+  return p;
+}
+const ensureRange = async (a, b) => {
+  if (!CHUNKS || !(b > a)) return;
+  await Promise.all(CHUNKS.map((c, k) => (c.b > a && c.a < b && !CHUNK_DONE[k] ? loadChunk(k) : null)).filter(Boolean));
+};
+const ensureIdx = async list => {
+  if (!CHUNKS || !list.length) return;
+  const ks = new Set();
+  for (const i of list) { const k = chunkOf(i); if (k >= 0 && !CHUNK_DONE[k]) ks.add(k); }
+  await Promise.all([...ks].map(loadChunk));
+};
+const allLoaded = () => !CHUNKS || CHUNK_DONE.filter(Boolean).length === CHUNKS.length;
+const ensureAll = async () => { if (CHUNKS) await ensureRange(0, T.length); };
 
 const trackURL = i => BASE + encPath(T[i].path);
 const artURL = fi => FOLDER_ART[fi] || null;
@@ -461,7 +540,7 @@ function buildTree() {
   ROOTNODE = { id: 0, path: null, name: "All tracks", parent: null, kids: [], start: 0, end: T.length, depth: -1, open: true };
   NODES = [ROOTNODE];
   const mk = (path, name, parent) => {
-    const n = { id: NODES.length, path, name, parent, kids: [], start: -1, end: -1, depth: parent.depth + 1, open: false };
+    const n = { id: NODES.length, path, name: nf(name), parent, kids: [], start: -1, end: -1, depth: parent.depth + 1, open: false };
     NODES.push(n); parent.kids.push(n); NODE_BY_PATH.set(path, n);
     return n;
   };
@@ -472,8 +551,15 @@ function buildTree() {
     for (const part of f.split("/")) { path = path ? `${path}/${part}` : part; parent = NODE_BY_PATH.get(path) || mk(path, part, parent); }
     return parent;
   });
-  for (let i = 0; i < T.length; i++)
-    for (let n = FNODE[T[i].fi]; n && n !== ROOTNODE; n = n.parent) { if (n.start < 0) n.start = i; n.end = i + 1; }
+  // Tracks are stored per folder in order, so each folder owns a contiguous [start, end):
+  // FCOUNT is enough to derive every node's range without touching track data.
+  let pos = 0;
+  for (let fi = 0; fi < FOLDERS.length; fi++) {
+    const c = FCOUNT[fi] || 0;
+    if (!c) continue;
+    const a = pos; pos += c; const b = pos;
+    for (let n = FNODE[fi]; n && n !== ROOTNODE; n = n.parent) { if (n.start < 0) n.start = a; n.end = b; }
+  }
   if (ROOTNODE.kids.length <= 5) ROOTNODE.kids.forEach(n => n.open = n.kids.length > 0);
 }
 
@@ -621,15 +707,28 @@ window.addEventListener("hashchange", () => {
   applyRoute(r, { restore: true, cue: true });
 });
 
-function applyRoute(r, { restore = false, cue = false } = {}) {
+let ROUTE_SEQ = 0;
+// Make sure the track range this route needs is in T before anything renders.
+async function needFor(r) {
+  if (!CHUNKS) return;
+  if (r.q || r.v === "fav") { await ensureAll(); if (r.v === "fav") loadFavs(); return; }
+  if (r.v === "queue") { if (!allLoaded() && (Q.ctx.length || Q.up.length)) await ensureIdx(Q.ctx.length ? Q.ctx : Q.up); return; }
+  const n = r.f == null ? ROOTNODE : NODE_BY_PATH.get(r.f);
+  if (n && n.start >= 0) await ensureRange(n.start, n.end);
+}
+async function applyRoute(r, { restore = false, cue = false } = {}) {
   if (r.v === "lib" && r.f != null && !NODE_BY_PATH.has(r.f)) { toast(`Folder not found: ${r.f}`); r.f = null; }
   ROUTE = { v: r.v, f: r.v === "lib" ? r.f : null, q: r.v === "queue" ? "" : r.q };
   if (document.activeElement !== searchEl) searchEl.value = ROUTE.q;
   searchEl.placeholder = ROUTE.v === "fav" ? "Search favorites…"
     : ROUTE.v === "lib" && ROUTE.f != null ? `Search in ${NODE_BY_PATH.get(ROUTE.f).name}…` : "Search all tracks…";
   if (ROUTE.v === "lib" && ROUTE.f != null) revealNode(NODE_BY_PATH.get(ROUTE.f)); else markActive();
+  const seq = ++ROUTE_SEQ;
+  try { await needFor(ROUTE); } catch {}
+  if (seq !== ROUTE_SEQ) return;                      // another navigation won the race
   renderView(restore ? SCROLLS.get(hashOf(ROUTE)) || 0 : 0);
   closeNav();
+  setTimeout(warmCandidate, 0);          // keep the pre-opened candidate in step with the view
   if (r.t) focusTrack(r.t, cue);
 }
 
@@ -642,7 +741,8 @@ function listFor(r) {
 function filterQ(list, q) {
   const toks = fold(q || "").split(/\s+/).filter(Boolean);
   if (!toks.length) return list;
-  if (!HAY) HAY = T.map(t => fold([t.title, t.artist, t.album, t.albumArtist, t.genre, t.year || "", FOLDERS[t.fi], t.file].join("\n")));
+  if (!HAY) HAY = T.map(t => fold([t.title, t.artist, t.album, t.albumArtist, t.genre, t.year || "",
+    prettyPath(FOLDERS[t.fi] || ""), nf(stem(t.file)), t.file].join("\n")));
   const out = [];
   outer: for (let k = 0; k < list.length; k++) {
     const h = HAY[list[k]];
@@ -665,7 +765,8 @@ function hl(s) {
 
 function renderView(scrollTop = 0) {
   setHL(ROUTE.q);
-  $("loader").hidden = true;
+  performance.mark('lib-first-view');
+    $("loader").hidden = true;
   if (ROUTE.v === "queue") { renderQueue(scrollTop); return; }
   VIEW = listFor(ROUTE);
   HDR = new Map();
@@ -738,7 +839,7 @@ function trackRow(i, o) {
 }
 function folderRow(fi) {
   const f = FOLDERS[fi], art = artURL(fi), h = HDR.get(fi) || [0, 0];
-  const name = f === "" ? "Loose tracks" : f.slice(f.lastIndexOf("/") + 1), parent = f.includes("/") ? f.slice(0, f.lastIndexOf("/")) + " · " : "";
+  const name = f === "" ? "Loose tracks" : nf(f.slice(f.lastIndexOf("/") + 1)), parent = f.includes("/") ? prettyPath(f.slice(0, f.lastIndexOf("/"))) + " · " : "";
   return `<div class="album-h" data-fi="${fi}" draggable="true" title="${esc(f || "Loose tracks")}">`
     + `<div class="ah-art"${art ? ` data-art="${esc(art)}"` : ""}>${art ? `<img src="${esc(art)}" loading="lazy" decoding="async" alt="">` : "♪"}</div>`
     + `<div class="ah-text"><div class="ah-name">${hl(name)}</div><div class="ah-meta">${esc(parent)}${plural(h[0], "track")} · ${fmtLong(h[1])}</div></div>`
@@ -773,8 +874,9 @@ function itemIndexOf(i) {
   if (ROUTE.v === "queue") return QITEMS.findIndex(x => x.k === 0 && x.i === i);
   return ITEMS.indexOf(i);
 }
-function focusTrack(path, cue) {
-  const i = BY_PATH.get(path);
+async function focusTrack(path, cue) {
+  let i = BY_PATH.get(path);
+  if (i === undefined && CHUNKS) { try { await ensureAll(); } catch {} i = BY_PATH.get(path); }
   if (i === undefined) { toast("That track is no longer in the library"); return; }
   let k = itemIndexOf(i);
   if (k < 0 && ROUTE.v !== "queue") {                 // not in this view (e.g. filtered out): open its folder
@@ -837,13 +939,51 @@ const upcoming = () => Q.up.length + Math.max(0, Q.ctx.length - Q.pos - 1);
 
 function load(i, fromUp, play, at = 0) {
   if (!(i >= 0 && i < T.length)) return;
-  const follow = CUR >= 0 && VL.visible(itemIndexOf(CUR));
+  if (!T[i]) {                                         // its chunk isn't in memory yet: fetch, then retry
+    ensureIdx([i]).then(() => { if (T[i]) load(i, fromUp, play, at); }).catch(() => toast("Couldn't load that track's data"));
+    return;
+  }
   CUR = i; FROM_UP = fromUp; WANT = play; PENDING_SEEK = at;
-  audio.src = trackURL(i);
-  applyRate();
+  const el = spare();                                  // the idle element, usually already buffered
+  if (el.__i !== i) { el.__i = i; el.__warm = false; el.src = trackURL(i); }
+  audio.pause();
+  audio = el;
+  applyRate(); applyVol();
   if (play) audio.play().catch(() => {});
   nowbar(); mediaMeta(); queueChanged();
-  if (ROUTE.v !== "queue") { VL.refresh(); if (follow) VL.scrollTo(itemIndexOf(i), "nearest"); }
+  if (ROUTE.v !== "queue") VL.refresh();
+  const k = itemIndexOf(i);
+  if (k >= 0) VL.scrollTo(k, "nearest");
+  bufferNext();
+}
+function peekNext() {
+  if (Q.up.length) return Q.up[0];
+  if (Q.pos + 1 < Q.ctx.length) return Q.ctx[Q.pos + 1];
+  if (P.repeat === 1 && Q.ctx.length) return Q.ctx[0];
+  return -1;
+}
+// The idle element pre-reads the track that next() will pick, so switching costs one play().
+function bufferNext() {
+  const el = spare(), j = peekNext();
+  if (j < 0 || j === CUR || !T[j]) return;             // unknown track (chunk not loaded): skip the pre-read
+  el.__warm = false;
+  if (el.__i !== j) { el.__i = j; el.src = trackURL(j); }
+  el.preload = "auto";
+}
+// Nothing loaded yet: pre-read one track of the current view, so the first click on
+// Shuffle/Play starts from an already opened file instead of a cold one.
+function warmCandidate() {
+  if (WANT || CUR >= 0 || !VIEW.length) return;
+  const el = spare();
+  if (el.__warm && VIEW.includes(el.__i)) return;      // already holds a usable candidate
+  const j = VIEW[Math.floor(Math.random() * VIEW.length)];
+  if (!T[j]) return;
+  el.__i = j; el.__warm = true; el.preload = "auto"; el.src = trackURL(j);
+}
+function warmStart(view) {                             // → a buffered candidate index, or -1
+  const el = spare();
+  if (!el.__warm || el.__i < 0 || el.readyState < 2) return -1;
+  return !view || view.includes(el.__i) ? el.__i : -1;
 }
 function next(auto) {
   if (auto && P.repeat === 2 && CUR >= 0) { audio.currentTime = 0; play(); return; }
@@ -864,7 +1004,7 @@ function prev() {
 function play() {
   if (CUR < 0) {                                       // nothing loaded: play the current view
     const list = ROUTE.v === "queue" ? [] : VIEW;
-    if (list.length) setContext(recipe(), list, P.shuffle ? -1 : list[0], true);
+    if (list.length) setContext(recipe(), list, P.shuffle ? warmStart(list) : list[0], true);
     else if (Q.up.length) next(false);
     return;
   }
@@ -930,7 +1070,7 @@ function queueChanged() {
 
 // ── Persistence ───────────────────────────────────────────────────────────
 const KEY_STATE = () => `mugal:${LIB}:state`, KEY_FAV = () => `mugal:${LIB}:fav`, KEY_PREFS = "mugal:prefs";
-const P = Object.assign({ font: 14, vol: 0.8, muted: false, repeat: 0, shuffle: false, tune: false, side: 260 }, store.get(KEY_PREFS, {}));
+const P = Object.assign({ font: 14, vol: 0.8, muted: false, repeat: 0, shuffle: false, tune: false, side: 260, theme: 'dark' }, store.get(KEY_PREFS, {}));
 if (store.get(KEY_PREFS) == null && typeof store.get("fontSize") === "number") P.font = store.get("fontSize");  // pre-15 setting
 P.font = Math.min(32, Math.max(9, P.font | 0 || 14)); P.vol = Math.min(1, Math.max(0, +P.vol || 0)); P.repeat = (P.repeat | 0) % 3;
 const savePrefs = () => store.set(KEY_PREFS, P);
@@ -938,9 +1078,9 @@ const savePrefs = () => store.set(KEY_PREFS, P);
 function saveState() {
   clearTimeout(saveTimer);
   if (!LIB) return;
-  const path = i => T[i].path;
+  const path = i => T[i] && T[i].path;
   const st = {
-    v: 1, r: Q.recipe, pos: Q.pos, up: Q.up.map(path), fromUp: FROM_UP,
+    v: 1, r: Q.recipe, pos: Q.pos, up: Q.up.map(path).filter(Boolean), fromUp: FROM_UP,
     sh: Q.sh && { seed: Q.sh.seed, pivot: Q.sh.pivot, anchor: Q.sh.anchor >= 0 ? path(Q.sh.anchor) : null },
     cur: CUR >= 0 ? path(CUR) : null, ctxCur: Q.pos >= 0 && Q.pos < Q.ctx.length ? path(Q.ctx[Q.pos]) : null,
     t: Math.floor(audio.currentTime || PENDING_SEEK || 0),
@@ -954,7 +1094,7 @@ function saveState() {
 }
 function restoreState() {
   const st = store.get(KEY_STATE(), null);
-  if (!st || st.v !== 1) return;
+  if (!st || st.v !== 1 || CUR >= 0) return;           // something is already loaded: don't clobber the session
   let missing = 0;
   const idx = p => { const i = BY_PATH.get(p); if (i === undefined) missing++; return i; };
   Q.up = (Array.isArray(st.up) ? st.up : []).map(idx).filter(i => i !== undefined);
@@ -980,7 +1120,9 @@ document.addEventListener("visibilitychange", () => { if (document.hidden) saveS
 // ── Favorites ─────────────────────────────────────────────────────────────
 const FAV = new Set();
 let FAV_LOST = [];                                    // favorites not in this scan (offline drive?) are kept
+let FAVS_LOADED = false;
 function loadFavs() {
+  if (FAVS_LOADED) return; FAVS_LOADED = true;       // favorites resolve through BY_PATH, so this needs the full index
   for (const p of store.get(KEY_FAV(), [])) { const i = BY_PATH.get(p); i === undefined ? FAV_LOST.push(p) : FAV.add(i); }
 }
 const saveFavs = () => store.set(KEY_FAV(), [...FAV].map(i => T[i].path).concat(FAV_LOST));
@@ -1043,40 +1185,50 @@ function setTune(on) { P.tune = on; savePrefs(); applyRate(); modesUI(); toast(o
 // ── Audio element ─────────────────────────────────────────────────────────
 let SCRUB = false, lastSave = 0;
 const setFill = (el, f) => el.style.setProperty("--p", `${Math.max(0, Math.min(1, f)) * 100}%`);
-audio.addEventListener("loadedmetadata", () => {
-  const d = audio.duration;
-  $("time-tot").textContent = fmt(d);
-  const t = T[CUR];
-  if (t && !t.dur && isFinite(d)) { t.dur = Math.round(d * 10) / 10; VL.refresh(); }
-  const seekable = audio.seekable.length > 0 && isFinite(d);
-  scrubber.disabled = !seekable;
-  scrubber.title = seekable ? "" : "Seeking unavailable (the server doesn't support range requests)";
-  if (PENDING_SEEK && seekable && PENDING_SEEK < d) audio.currentTime = PENDING_SEEK;
-  PENDING_SEEK = 0;
-  mediaPos();
-});
-audio.addEventListener("timeupdate", () => {
-  if (!audio.duration || SCRUB) return;
-  const f = audio.currentTime / audio.duration;
-  scrubber.value = Math.round(f * 1000); setFill(scrubber, f);
-  $("time-cur").textContent = fmt(audio.currentTime);
-  if (Date.now() - lastSave > 10000) { lastSave = Date.now(); saveState(); }
-});
-audio.addEventListener("play", () => { $("btn-play").textContent = "⏸"; $("btn-play").setAttribute("aria-label", "Pause"); $("btn-play").title = "Pause (Space)"; nowbar(); VL.refresh(); });
-audio.addEventListener("pause", () => { $("btn-play").textContent = "▶"; $("btn-play").setAttribute("aria-label", "Play"); $("btn-play").title = "Play (Space)"; nowbar(); VL.refresh(); saveState(); });
-audio.addEventListener("playing", () => { FAILS = 0; });
-audio.addEventListener("ended", () => next(true));
-audio.addEventListener("ratechange", mediaPos);
-audio.addEventListener("seeked", mediaPos);
-audio.addEventListener("error", () => {
-  if (CUR < 0 || !audio.getAttribute("src")) return;
-  const why = { 2: "network error", 3: "can't decode it", 4: "file missing or format not supported" }[audio.error?.code] || "can't play it";
-  const t = T[CUR];
-  if (!WANT) { toast(`Can't load “${t.title}” — ${why}`); return; }
-  if (++FAILS >= 5) { WANT = false; toast(`Stopped: ${FAILS} tracks in a row couldn't be played`); return; }
-  toast(`Skipped “${t.title}” — ${why}`);
-  setTimeout(() => { if (WANT) next(false); }, 300);
-});
+function hook(el) {
+  el.addEventListener("loadedmetadata", () => {
+    if (el !== audio) return;
+    const d = audio.duration;
+    $("time-tot").textContent = fmt(d);
+    const t = T[CUR];
+    if (t && !t.dur && isFinite(d)) { t.dur = Math.round(d * 10) / 10; VL.refresh(); }
+    const seekable = audio.seekable.length > 0 && isFinite(d);
+    scrubber.disabled = !seekable;
+    scrubber.title = seekable ? "" : "Seeking unavailable (the server doesn't support range requests)";
+    if (PENDING_SEEK && seekable && PENDING_SEEK < d) audio.currentTime = PENDING_SEEK;
+    PENDING_SEEK = 0;
+    mediaPos();
+  });
+  el.addEventListener("timeupdate", () => {
+    if (el !== audio || !audio.duration || SCRUB) return;
+    const f = audio.currentTime / audio.duration;
+    scrubber.value = Math.round(f * 1000); setFill(scrubber, f);
+    $("time-cur").textContent = fmt(audio.currentTime);
+    if (Date.now() - lastSave > 10000) { lastSave = Date.now(); saveState(); }
+  });
+  el.addEventListener("play", () => {
+    if (el !== audio) return;
+    $("btn-play").textContent = "⏸"; $("btn-play").setAttribute("aria-label", "Pause"); $("btn-play").title = "Pause (Space)"; nowbar(); VL.refresh();
+  });
+  el.addEventListener("pause", () => {
+    if (el !== audio) return;
+    $("btn-play").textContent = "▶"; $("btn-play").setAttribute("aria-label", "Play"); $("btn-play").title = "Play (Space)"; nowbar(); VL.refresh(); saveState();
+  });
+  el.addEventListener("playing", () => { if (el === audio) FAILS = 0; });
+  el.addEventListener("ended", () => { if (el === audio) next(true); });
+  el.addEventListener("ratechange", () => { if (el === audio) mediaPos(); });
+  el.addEventListener("seeked", () => { if (el === audio) mediaPos(); });
+  el.addEventListener("error", () => {
+    if (el !== audio || CUR < 0 || !audio.getAttribute("src")) return;
+    const why = { 2: "network error", 3: "can't decode it", 4: "file missing or format not supported" }[audio.error?.code] || "can't play it";
+    const t = T[CUR];
+    if (!WANT) { toast(`Can't load “${t.title}” — ${why}`); return; }
+    if (++FAILS >= 5) { WANT = false; toast(`Stopped: ${FAILS} tracks in a row couldn't be played`); return; }
+    toast(`Skipped “${t.title}” — ${why}`);
+    setTimeout(() => { if (WANT) next(false); }, 300);
+  });
+}
+hook(EL_A); hook(EL_B);
 scrubber.addEventListener("pointerdown", () => { SCRUB = true; });
 scrubber.addEventListener("input", () => {
   SCRUB = true;
@@ -1089,9 +1241,10 @@ scrubber.addEventListener("change", () => {
 });
 window.addEventListener("pointerup", () => { SCRUB = false; });
 
+function applyVol() { EL_A.volume = EL_B.volume = P.vol; EL_A.muted = EL_B.muted = P.muted; }
 function volumeUI() {
   volEl.value = P.vol; setFill(volEl, P.muted ? 0 : P.vol);
-  audio.volume = P.vol; audio.muted = P.muted;
+  applyVol();
   $("vol-icon").innerHTML = P.muted || P.vol === 0 ? ICON.mute : P.vol < 0.5 ? ICON.volLow : ICON.vol;
 }
 function setVol(v) { P.vol = Math.min(1, Math.max(0, Math.round(v * 100) / 100)); P.muted = false; volumeUI(); savePrefs(); }
@@ -1103,8 +1256,10 @@ function mediaMeta() {
   if (!("mediaSession" in navigator) || CUR < 0) return;
   const t = T[CUR], art = artURL(t.fi);
   try {
-    navigator.mediaSession.metadata = new MediaMetadata({ title: t.title, artist: t.artist, album: t.album || FOLDERS[t.fi],
-      artwork: art ? [{ src: absURL(art) }] : [] });
+    navigator.mediaSession.metadata = new MediaMetadata({ title: t.title, artist: t.artist,
+      album: t.album || nf(String(FOLDERS[t.fi] || "").slice(String(FOLDERS[t.fi] || "").lastIndexOf("/") + 1)),
+      // Media Session only accepts http(s)/data/blob artwork; on file:// pages it stays empty
+      artwork: art && /^(?:https?|data|blob):/i.test(absURL(art)) ? [{ src: absURL(art) }] : [] });
   } catch {}
 }
 function mediaPos() {
@@ -1151,8 +1306,8 @@ $("viewbar").addEventListener("click", e => {
   const b = e.target.closest("[data-vb]");
   if (!b) return;
   const v = b.dataset.vb;
-  if (v === "play" && VIEW.length) setContext(recipe(), VIEW, P.shuffle ? -1 : VIEW[0], true);
-  if (v === "shuffle" && VIEW.length) { if (!P.shuffle) { P.shuffle = true; savePrefs(); modesUI(); } setContext(recipe(), VIEW, -1, true); }
+  if (v === "play" && VIEW.length) setContext(recipe(), VIEW, P.shuffle ? warmStart(VIEW) : VIEW[0], true);
+  if (v === "shuffle" && VIEW.length) { if (!P.shuffle) { P.shuffle = true; savePrefs(); modesUI(); } setContext(recipe(), VIEW, warmStart(VIEW), true); }
   if (v === "m3u") exportM3U(queueList(), "queue");
   if (v === "clear") clearUp();
 });
@@ -1325,7 +1480,7 @@ $("modal-overlay").addEventListener("click", e => { if (e.target === $("modal-ov
 function showInfo(i) {
   const t = T[i], art = artURL(t.fi);
   const rows = [["Title", t.title], ["Artist", t.artist], ["Album", t.album], ["Album artist", t.albumArtist], ["Track", t.track || ""],
-    ["Disc", t.disc || ""], ["Year", t.year || ""], ["Genre", t.genre], ["Duration", t.dur ? fmt(t.dur) : ""], ["Folder", FOLDERS[t.fi] || "(library root)"],
+    ["Disc", t.disc || ""], ["Year", t.year || ""], ["Genre", t.genre], ["Duration", t.dur ? fmt(t.dur) : ""], ["Folder", FOLDERS[t.fi] ? prettyPath(FOLDERS[t.fi]) : "(library root)"],
     ["File", t.file], ["Favorite", FAV.has(i) ? "★ yes" : ""]].filter(([, v]) => v !== "" && v != null);
   showModal(`<div class="mh-art">${art ? `<img src="${esc(art)}" alt="">` : "♪"}</div><div><div class="mh-title">${esc(t.title)}</div><div class="mh-sub">${esc([t.artist, t.album].filter(Boolean).join(" — "))}</div></div>`,
     rows.map(([k, v]) => `<div class="mi-row"><div class="mi-k">${k}</div><div class="mi-v">${esc(v)}</div></div>`).join(""));
@@ -1486,6 +1641,14 @@ function applyFont() {
   savePrefs();
   if (T.length) VL.remeasure();
 }
+function applyTheme() {
+  const light = P.theme === "light";
+  document.documentElement.dataset.theme = light ? "light" : "dark";
+  document.querySelector('meta[name="color-scheme"]').content = light ? "light" : "dark";
+  $("btn-theme").textContent = light ? "Light" : "Dark";
+  savePrefs();
+}
+$("btn-theme").addEventListener("click", () => { P.theme = P.theme === "light" ? "dark" : "light"; applyTheme(); });
 $("fs-minus").addEventListener("click", () => { if (P.font > 9) { P.font--; applyFont(); } });
 $("fs-plus").addEventListener("click", () => { if (P.font < 32) { P.font++; applyFont(); } });
 
@@ -1523,23 +1686,75 @@ function fail(html) { $("loader").innerHTML = `<span style="font-size:1.5rem">�
 function boot() {
   const raw = window.__AUDIO_DATA;
   if (!raw) return fail("<b>audiodata.js</b> not found next to this page.<br>Generate it with <code>python mugal.py &lt;music folder&gt;</code>");
-  if (raw.schema !== SCHEMA || !Array.isArray(raw.tracks))
+  if (raw.schema !== SCHEMA || !(Array.isArray(raw.tracks) || Array.isArray(raw.chunks)))
     return fail("<b>audiodata.js</b> was made by a different mugal version.<br>Re-run <code>python mugal.py</code> to update it.");
   try { decode(raw); } catch (err) { return fail(`Couldn't read audiodata.js (${esc(err.message)}). Re-run mugal.py.`); }
   delete window.__AUDIO_DATA;
   try { indexedDB.deleteDatabase("MusicPlayer"); } catch {}   // cache used by mugal ≤ 14; no longer needed
-  buildTree(); loadFavs();
+  buildTree();
+  if (!CHUNKS) { loadFavs(); restoreState(); }        // chunked data hydrates once the rest is in memory
   document.documentElement.style.fontSize = P.font + "px"; $("fs-val").textContent = P.font + "px";
+  applyTheme();
   volumeUI(); modesUI(); applyRate();
   VL.measure();
   renderTree();
-  restoreState();
-  const r = parseHash();
+  const r0 = parseHash();
+  const r = location.hash.length > 1 ? r0 : (lastRoute() || r0);
   if (r.t) replaceHash(hashOf({ ...r, t: null }));
-  applyRoute(r, { cue: true });
+  const later = () => setTimeout(hydrate, 600);
+  applyRoute(r, { cue: true }).then(later, later);
   counts(); nowbar();
   const d = new Date((META.generated || 0) * 1000);
   $("lib-info").textContent = `${plural(T.length, "track")} · ${plural(FOLDERS.length, "folder")} · scanned ${d.toLocaleString()} · v${META.version}`;
+  setTimeout(warmCandidate, 0);          // pre-open one track so the first click isn't cold
+  setTimeout(warmCandidate, 1500);
+}
+// No deep link: reopen the view that was last used, so a folder library starts on its chunk
+// instead of pulling all 138k track rows first. Falls back to "All tracks" as before.
+function lastRoute() {
+  const st = store.get(KEY_STATE(), null);
+  if (!st || st.v !== 1 || !st.r || typeof st.r !== "object") return null;
+  const v = st.r.v;
+  if (v === "fav") return { v: "fav", f: null, q: "", t: null };
+  if (v !== "lib") return null;
+  const f = st.r.f ?? null;
+  if (f != null && !NODE_BY_PATH.has(f)) return null;
+  return { v: "lib", f, q: "", t: null };
+}
+// First screen has what it needs; this fills T with the whole library afterwards,
+// so queues, favorites and "All tracks" work without a reload.
+let HYDRATED = false;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// Don't pull the rest of the library while a track is still opening: over a network share
+// the audio and the data chunks compete for the same bandwidth.
+async function waitPlayable() {
+  for (let i = 0; i < 60 && WANT && !audio.paused && audio.readyState < 3; i++) await sleep(250);
+}
+async function hydrate() {
+  if (HYDRATED) return;
+  if (!CHUNKS || allLoaded()) { afterAll(); return; }
+  let failed = 0;
+  for (let k = 0; k < CHUNKS.length; k++) {
+    if (CHUNK_DONE[k]) continue;
+    await waitPlayable();
+    try { await loadChunk(k); failed = 0; }
+    catch (err) { if (++failed >= 2) break; }           // share went away: keep what we have
+  }
+  if (allLoaded()) afterAll();
+  else {
+    console.warn("library chunks incomplete", CHUNK_DONE.filter(Boolean).length, "/", CHUNKS.length);
+    HYDRATED = true;
+  }
+  bufferNext();                                        // the pre-read may have been skipped earlier
+}
+function afterAll() {
+  if (HYDRATED) return; HYDRATED = true;
+  performance.mark('lib-hydrated');
+  loadFavs();
+  restoreState();
+  HAY = null;
+  counts(); nowbar();
+  if (ROUTE.v === "fav" || ROUTE.v === "queue") renderView(scroller.scrollTop); else { VL.refresh(); renderTree(); }
 }
 document.addEventListener("DOMContentLoaded", boot);
 </script>
