@@ -98,7 +98,7 @@ uv run https://raw.githubusercontent.com/glowinthedark/432-hz-music-player/refs/
 ## Output
 
 - `index.html`: the player (no external dependencies)
-- `audiodata.js`: compact track data (≈ 100 bytes per track; 100k tracks ≈ 10 MB)
+- `audiodata.js`: compact track data (≈ 100 bytes per track; 100k tracks ≈ 10 MB). Optionally split into a manifest + `audiodata.0.js` … chunks by `split-data.py` (see below)
 - `.mugal/`: scan cache, `scan-report.txt` (unreadable files, skipped folders), covers extracted from read-only folders. If OUTPUT isn't writable, the cache and report go to the user cache folder instead (`$XDG_CACHE_HOME/mugal`, else `~/Library/Caches/mugal` on macOS, `~/.cache/mugal` on Linux, `%LOCALAPPDATA%\mugal\Cache` on Windows), so rescans stay fast
 
 Files are replaced atomically (temp file + rename). If only the files themselves are writable, not their folder (e.g. write permission granted on `audiodata.js` alone), they're overwritten in place instead; `index.html` isn't rewritten when it's already current. If `audiodata.js` can't be written at all, mugal stops before scanning and suggests `-o DIR`.
@@ -106,6 +106,60 @@ Files are replaced atomically (temp file + rename). If only the files themselves
 Rescans only re-read new or changed files, so they're near-instant. Hidden and system folders are skipped on macOS, Windows, Linux, Android and NAS volumes, and so are folders containing `.nomedia` (use `--all` to include them). Folder symlinks are followed, with loop detection.
 
 `--serve` is a small debugging helper. For regular use, open `index.html` from disk or put the folder behind a real web server (Caddy, nginx, Apache), which also enables seeking over HTTP. If nginx denies dot-files, allow `/.mugal/covers/`.
+
+## This fork: a fast start on big or slow libraries
+
+`mugal.py` is unchanged. The player can now start without reading the whole library first, and it opens the first track instead of waiting for a cold file. Both changes are optional and backwards compatible: a plain `audiodata.js` from `mugal.py` still works exactly as before.
+
+### Why it was slow
+
+Everything the player knows lives in one `audiodata.js` (~100 bytes per track, so ≈17 MB for 100k tracks). The page could not draw a single row until that file had been read and parsed — measured at **2.8 s** for 138k tracks on a mapped network drive (SMB, ≈11 MB/s). And once it opened, the first click on *Shuffle* still had to open a cold audio file before any sound came out (0.6–2.1 s, up to 3.9 s for an 11.9 MB FLAC).
+
+### 1. Chunked track data (optional)
+
+`split-data.py` rewrites `audiodata.js` as a manifest plus folder-aligned chunks. It is a pure post-process — no rescan, nothing is re-read from disk:
+
+```
+audiodata.js     4.2 MB  folders, strings, cover art, display fixes, chunk table
+audiodata.0.js   1.2 MB  tracks 0–9,968      ≈1.2–1.5 MB each, cut on folder boundaries
+audiodata.1.js   1.4 MB  tracks 9,968–26,090
+audiodata.2.js   1.5 MB  tracks 26,090–44,450   …
+audiodata-full.js  17 MB  the original one-file data (kept for rollback)
+```
+
+```bash
+python mugal.py ~/Music            # scan as usual → one big audiodata.js
+python split-data.py ./player      # report only
+python split-data.py ./player --write
+```
+
+The player detects the format by itself:
+
+- the first screen reads the manifest plus only the chunk(s) that hold the folder being opened — **1.2–1.7 s warm / ≈1 s cold** instead of 2.8 s;
+- the remaining chunks are fetched one at a time in the background, pausing while a track is still buffering, so data loading never competes with playback;
+- *All tracks*, searching the whole library, favorites and the queue need every track, so they wait for the complete library (it arrives within a couple of seconds, and the view refreshes itself).
+
+Rollback: `mv audiodata-full.js audiodata.js` (written on the first split).
+
+The display-repair table (`fix`: the mapping that un-garbles Big5/GBK-mangled folder and track names) is not something `mugal.py` can regenerate, so the split also mirrors it to `.mugal/display-fix.json`. **After a rescan, run `split-data.py --write` again** — the repairs, the chunk layout and the fast start all come back in one step.
+
+### 2. Instant first track (no setup)
+
+The player keeps two `<audio>` elements: one plays, the idle one pre-opens the file that *Next* will pick, and before you press anything it quietly opens one track of the current view. Changing tracks then costs a `play()` instead of a cold file open.
+
+Measured on the same 138k-track library over SMB (headless Chrome + CDP, click → real audio):
+
+| Action | Before | After |
+|---|---|---|
+| First *Shuffle* on a freshly opened page | 0.6–2.1 s | **96 ms** |
+| *Next* × 5 in a row | 0.3–1.6 s (11.9 MB FLAC: 3.9 s) | **23–135 ms** |
+
+Related: with no `#hash` in the URL the player reopens the view you last used (a folder rather than *All tracks*), so a folder-first library starts on one chunk. Deep links still take precedence.
+
+Practical notes:
+
+- `--self-update` compares `player.html` with the upstream copy and may replace it; a copy of the chunk-aware player is kept at `.mugal/player-chunked-backup.html` in the output folder of this setup. The `<meta name="mugal-template">` date is what decides, so bump it if you edit the player.
+- The chunked layout is produced by `split-data.py`, not by `mugal.py`. If you re-scan and skip the extra step you simply get the old one-file behaviour.
 
 ## Requirements
 
