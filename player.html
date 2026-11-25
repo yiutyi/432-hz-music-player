@@ -67,6 +67,9 @@ mark{background:none;color:var(--accent)}
 .sp-btn:hover{border-color:var(--accent);color:var(--accent)}
 .sp-btn.on{border-color:var(--accent);color:var(--accent)}
 .sp-stepper{display:flex;align-items:center;gap:6px}
+.sp-btns{display:flex;align-items:center;gap:6px}
+.sp-input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:var(--radius);padding:4px 8px;font-size:.7857rem;font-family:var(--mono)}
+.sp-input:focus{outline:none;border-color:var(--accent)}
 .sp-stepper .sp-btn{padding:2px 8px;font-family:var(--mono);min-width:0}
 #fs-val{font-family:var(--mono);font-size:.7857rem;color:var(--text);width:3rem;text-align:center}
 #lib-info{font-size:.7143rem;color:var(--text3);font-family:var(--mono);margin-top:8px;border-top:1px solid var(--border);padding-top:8px;word-break:break-all}
@@ -300,10 +303,18 @@ input[type=range]:disabled{opacity:.35;cursor:not-allowed}
       <span class="sp-stepper"><button class="sp-btn" id="fs-minus" aria-label="Smaller">−</button><span id="fs-val">14px</span><button class="sp-btn" id="fs-plus" aria-label="Larger">+</button></span>
     </div>
     <h3>Library</h3>
+    <div class="sp-row"><span>Library folder (audio lives here)</span><button class="sp-btn" id="btn-root-auto">Auto</button></div>
+    <div class="sp-row"><input id="root-input" class="sp-input" spellcheck="false" placeholder="D:\Media\file\music"><button class="sp-btn" id="btn-root-set">Use</button></div>
+    <div id="root-info" class="sp-note"></div>
     <div class="sp-row"><span>Add playlist (.m3u) to queue</span><button class="sp-btn" id="btn-import">Choose…</button></div>
     <div class="sp-row"><span>Reload library</span><button class="sp-btn" id="btn-reload">Reload</button></div>
     <div class="sp-row"><span>Keyboard shortcuts</span><button class="sp-btn" id="btn-help">?</button></div>
     <div id="lib-info"></div>
+    <h3>Favorites &amp; history files</h3>
+    <div class="sp-row"><span>Keep them in the player folder</span><button class="sp-btn" id="btn-data-dir">Folder…</button></div>
+    <div class="sp-row"><span>Save / load by hand</span><span class="sp-btns"><button class="sp-btn" id="btn-data-save">Save</button><button class="sp-btn" id="btn-data-load">Load…</button></span></div>
+    <div id="data-info" class="sp-note"></div>
+    <input type="file" id="file-data" accept=".js,.json,text/javascript,application/json" hidden>
     <input type="file" id="file-import" accept=".m3u,.m3u8,audio/x-mpegurl,audio/mpegurl" hidden>
   </div>
 
@@ -312,6 +323,7 @@ input[type=range]:disabled{opacity:.35;cursor:not-allowed}
       <div id="nav">
         <div class="nv" data-nav="queue" title="Queue — drop tracks here to add them"><span class="ico">≡</span><span class="label">Queue</span><span class="cnt" id="cnt-queue"></span></div>
         <div class="nv" data-nav="fav" title="Favorites — drop tracks here to add them"><span class="ico">★</span><span class="label">Favorites</span><span class="cnt" id="cnt-fav"></span></div>
+        <div class="nv" data-nav="hist" title="Play history — most recently played first"><span class="ico">⟲</span><span class="label">History</span><span class="cnt" id="cnt-hist"></span></div>
       </div>
       <div id="tree-header">Library</div>
       <div id="tree" role="tree"></div>
@@ -416,6 +428,63 @@ const plural = (n, w) => `${fmtNum(n)} ${w}${n === 1 ? "" : "s"}`;
 const encPath = p => p.split("/").map(encodeURIComponent).join("/");
 const isAbs = u => /^[a-z][a-z0-9+.-]*:/i.test(u);
 const absURL = u => new URL(u, location.href).href;
+
+// ── Library root ──────────────────────────────────────────────────────────
+// The scan writes base:"../" — relative to the folder index.html was generated in. Keep the
+// player here and that is right; move the player somewhere else and the audio (and covers, whose
+// paths carry the same prefix) point at nothing. Chrome happily loads file:///D:/… media from a
+// file:///C:/ page (verified), so the fix is only about the base: derive it from the library path
+// in the data file, let the user pin one, and self-heal when the relative one stops working.
+function toBaseURL(s) {                               // "D:\Media\file\music" / "\\nas\share" / "file:///…" → URL
+  s = String(s || "").trim();
+  if (!s) return "";
+  const withSlash = u => { try { const x = new URL(u); return x.href.endsWith("/") ? x.href : x.href + "/"; } catch { return ""; } };
+  if (/^(?:file|http|https):/i.test(s)) return withSlash(s);
+  let p = s.replace(/\\/g, "/");
+  if (p.startsWith("//")) return withSlash("file:" + p);          // \\nas\share → file://nas/share
+  if (/^[A-Za-z]:/.test(p)) return withSlash("file:///" + p);     // D:\x        → file:///D:/x
+  try { const x = new URL(p.endsWith("/") ? p : p + "/", document.baseURI); return x.href; } catch { return ""; }
+}
+function deURL(u) {                                   // URL → the path a person recognises
+  if (!u) return "";
+  let s = "";
+  try {
+    if (/^file:\/\/\/[A-Za-z]:/i.test(u)) s = decodeURIComponent(u.slice(8)).replace(/\//g, "\\");
+    else if (/^file:\/\//i.test(u)) s = "\\\\" + decodeURIComponent(u.slice(7)).replace(/\//g, "\\");
+    else s = decodeURIComponent(u);
+  } catch { s = u; }
+  return s.replace(/[\\/]+$/, "");
+}
+function setBase(u, why) {
+  if (!u || u === BASE) return false;
+  BASE = u;
+  console.info("[library] base → " + u + (why ? " (" + why + ")" : ""));
+  try { VL.refresh(); renderTree(); nowbar(); } catch {}
+  return true;
+}
+// Is the relative base still pointing at the library? One cover is enough to tell: if it loads
+// we are fine, if not try the path from the data file.
+function probeBase() {
+  if (BASE_USER || !BASE_ROOT || BASE_ROOT === BASE) return;
+  const idx = ART_REL.findIndex(x => x != null);
+  if (idx < 0) return;
+  const test = (base, cb) => {
+    const img = new Image();
+    let done = false;
+    const end = ok => { if (done) return; done = true; clearTimeout(timer); img.onload = img.onerror = null; cb(ok); };
+    const timer = setTimeout(() => end(false), 4000);
+    img.onload = () => end(true);
+    img.onerror = () => end(false);
+    img.src = base + ART_REL[idx];
+  };
+  test(BASE, ok => {
+    if (ok) return;
+    test(BASE_ROOT, ok2 => {
+      if (!ok2) return;
+      if (setBase(BASE_ROOT, "the player folder is outside the library")) toast("Library: " + deURL(BASE_ROOT));
+    });
+  });
+}
 const fold = s => String(s).normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
 const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const stem = f => { const i = f.lastIndexOf("."); return i > 0 ? f.slice(0, i) : f; };
@@ -448,7 +517,9 @@ function toast(msg, action) {
 function hideToast() { $("toast").classList.remove("show"); }
 
 // ── Library ───────────────────────────────────────────────────────────────
-let T = [], FOLDERS = [], FOLDER_ART = [], BASE = "", ROOT = "", LIB = "", META = {};
+let T = [], FOLDERS = [], ART_REL = [], ART_ABS = [], BASE = "", ROOT = "", LIB = "", META = {};
+let BASE_AUTO = "", BASE_ROOT = "", BASE_USER = "";   // see "Library root" below: the player folder may sit anywhere
+let PLAYED_OK = false, BASE_RETRY = false;
 let FIX = null;                                      // garbled-name → repaired text (display only)
 const BY_PATH = new Map();
 let NODES = [], FNODE = [], ROOTNODE = null;
@@ -462,9 +533,17 @@ function decode(raw) {
   FOLDERS = F;
   STRINGS = S;
   FIX = raw.fix || null;                             // folder/file names are kept byte-exact (they build the audio URLs)
-  BASE = raw.base ? (isAbs(raw.base) ? raw.base : encPath(raw.base)) : "";
+  // Where the files are: the scan wrote a base relative to the old player folder, so resolve it
+  // against this page. `raw.root` is the library path itself and survives the player moving.
+  BASE_AUTO = raw.base ? (isAbs(raw.base) ? raw.base : absURL(raw.base)) : absURL(".");
+  BASE_ROOT = toBaseURL(raw.root);
+  BASE_USER = toBaseURL(P.libroot || "");
+  BASE = BASE_USER || BASE_AUTO;
   ROOT = String(raw.root || "");
-  FOLDER_ART = raw.art.map(si => { const h = S[si]; return h ? (isAbs(h) ? h : encPath(h)) : null; });
+  const rb = raw.base || "";
+  const relOf = h => { const r = rb && h.startsWith(rb) ? h.slice(rb.length) : h; return r ? encPath(r) : null; };
+  ART_REL = raw.art.map(si => { const h = S[si]; return h && !isAbs(h) ? relOf(h) : null; });
+  ART_ABS = raw.art.map(si => { const h = S[si]; return h && isAbs(h) ? h : null; });
   // Tracks may arrive as one big array (mugal.py) or split into folder-aligned chunks (split-data.py).
   // With chunks, T only holds the ranges that are loaded so far; T.length is always the full count.
   CHUNKS = Array.isArray(raw.chunks) && raw.chunks.length ? raw.chunks : null;
@@ -532,7 +611,9 @@ const allLoaded = () => !CHUNKS || CHUNK_DONE.filter(Boolean).length === CHUNKS.
 const ensureAll = async () => { if (CHUNKS) await ensureRange(0, T.length); };
 
 const trackURL = i => BASE + encPath(T[i].path);
-const artURL = fi => FOLDER_ART[fi] || null;
+// Art strings already carry the scan-time base ("../…"), so keep them root-relative and prefix
+// them with the base in force right now — that is what lets the player folder move.
+const artURL = fi => ART_REL[fi] != null ? BASE + ART_REL[fi] : ART_ABS[fi];
 const folderName = n => n === ROOTNODE ? "All tracks" : n.name;
 
 // Folder tree. Tracks arrive sorted depth-first by folder, so every node is a contiguous [start, end).
@@ -661,16 +742,16 @@ const VL = (() => {
 })();
 
 // ── Views & routing ───────────────────────────────────────────────────────
-// Route: { v: "lib" | "fav" | "queue", f: folder path (null = all, "" = loose tracks), q: search }
+// Route: { v: "lib" | "fav" | "hist" | "queue", f: folder path (null = all, "" = loose tracks), q: search }
 // Hash:  #/            all tracks          #/Jazz/Blue%20Train   folder        #loose
-//        #favorites    #queue               …?q=search&t=track/path (focus + cue that track)
+//        #favorites    #history    #queue   …?q=search&t=track/path (focus + cue that track)
 let ROUTE = { v: "lib", f: null, q: "" };
 let VIEW = new Int32Array(0), ITEMS = new Int32Array(0), QITEMS = [], HDR = new Map(), HL = null, FLASH = -1;
 const SCROLLS = new Map();
 let IGNORE_HASH = null;
 
 function hashOf(r) {
-  const p = r.v === "queue" ? "queue" : r.v === "fav" ? "favorites"
+  const p = r.v === "queue" ? "queue" : r.v === "fav" ? "favorites" : r.v === "hist" ? "history"
     : r.f == null ? "/" : r.f === "" ? "loose" : "/" + encPath(r.f);
   const qs = [];
   if (r.q) qs.push("q=" + encodeURIComponent(r.q));
@@ -684,6 +765,7 @@ function parseHash() {
   const r = { v: "lib", f: null, q: (qs.get("q") || "").slice(0, 300), t: qs.get("t") };
   if (path === "queue") r.v = "queue";
   else if (path === "favorites") r.v = "fav";
+  else if (path === "history") r.v = "hist";
   else if (path === "loose") r.f = "";
   else if (path.startsWith("/") && path.length > 1) r.f = path.slice(1).split("/").map(dec).join("/");
   return r;
@@ -711,7 +793,7 @@ let ROUTE_SEQ = 0;
 // Make sure the track range this route needs is in T before anything renders.
 async function needFor(r) {
   if (!CHUNKS) return;
-  if (r.q || r.v === "fav") { await ensureAll(); if (r.v === "fav") loadFavs(); return; }
+  if (r.q || r.v === "fav" || r.v === "hist") { await ensureAll(); if (r.v === "fav") loadFavs(); return; }
   if (r.v === "queue") { if (!allLoaded() && (Q.ctx.length || Q.up.length)) await ensureIdx(Q.ctx.length ? Q.ctx : Q.up); return; }
   const n = r.f == null ? ROOTNODE : NODE_BY_PATH.get(r.f);
   if (n && n.start >= 0) await ensureRange(n.start, n.end);
@@ -721,6 +803,7 @@ async function applyRoute(r, { restore = false, cue = false } = {}) {
   ROUTE = { v: r.v, f: r.v === "lib" ? r.f : null, q: r.v === "queue" ? "" : r.q };
   if (document.activeElement !== searchEl) searchEl.value = ROUTE.q;
   searchEl.placeholder = ROUTE.v === "fav" ? "Search favorites…"
+    : ROUTE.v === "hist" ? "Search history…"
     : ROUTE.v === "lib" && ROUTE.f != null ? `Search in ${NODE_BY_PATH.get(ROUTE.f).name}…` : "Search all tracks…";
   if (ROUTE.v === "lib" && ROUTE.f != null) revealNode(NODE_BY_PATH.get(ROUTE.f)); else markActive();
   const seq = ++ROUTE_SEQ;
@@ -735,6 +818,7 @@ async function applyRoute(r, { restore = false, cue = false } = {}) {
 function listFor(r) {
   let base;
   if (r.v === "fav") base = favList();
+  else if (r.v === "hist") base = histList();
   else { const n = r.f == null ? ROOTNODE : NODE_BY_PATH.get(r.f); base = n ? range(n.start, n.end) : new Int32Array(0); }
   return filterQ(base, r.q);
 }
@@ -763,11 +847,80 @@ function hl(s) {
   return out + esc(s.slice(last));
 }
 
+// ── Play history ──────────────────────────────────────────────────────────
+// Newest first, one row per track (replaying a track moves it back to the top, it does not
+// list twice). Grouped by day, so the list reads like a log.
+let HIST = [], HITEMS = [], HIST_TS = new Map();
+const HIST_MAX = 500;
+const KEY_HIST = () => `mugal:${LIB}:hist`;
+function loadHist() {
+  const raw = store.get(KEY_HIST(), []);
+  HIST = (Array.isArray(raw) ? raw : []).filter(x => x && typeof x.p === "string").slice(0, HIST_MAX);
+  for (const x of HIST) if (!Number.isFinite(x.t)) x.t = 0;
+  HIST.sort((a, b) => b.t - a.t);
+}
+const saveHist = () => store.set(KEY_HIST(), HIST);
+const histList = () => {
+  const out = [], ts = new Map();
+  for (const h of HIST) {
+    const i = BY_PATH.get(h.p);
+    if (i === undefined || ts.has(i)) continue;        // gone from the library, or already listed
+    ts.set(i, h.t); out.push(i);
+  }
+  HIST_TS = ts;
+  return Int32Array.from(out);
+};
+function recHistory(i) {
+  if (!(i >= 0 && i < T.length) || !T[i]) return;
+  const p = T[i].path, t = Date.now(), k = HIST.findIndex(x => x.p === p);
+  if (k === 0 && t - HIST[0].t < 60000) { HIST[0].t = t; saveHist(); return; }   // same track, same minute
+  if (k >= 0) HIST.splice(k, 1);
+  HIST.unshift({ p, t });
+  if (HIST.length > HIST_MAX) HIST.length = HIST_MAX;
+  saveHist(); counts(); scheduleSync();
+}
+function histChanged() { counts(); if (ROUTE.v === "hist") renderHist(scroller.scrollTop); }
+
+function clearHist() {
+  if (!HIST.length) return;
+  HIST = []; saveHist(); histChanged(); scheduleSync();
+}
+const clockOf = t => new Date(t || 0).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const dayLabel = t => {
+  const d = new Date(t || 0), now = new Date();
+  const day = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = Math.round((day(now) - day(d)) / 86400000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  if (diff < 7) return d.toLocaleDateString([], { weekday: "long" });
+  return d.toLocaleDateString();
+};
+function renderHist(scrollTop = 0) {
+  setHL(ROUTE.q);
+  VIEW = listFor(ROUTE);
+  const it = [], ts = HIST_TS;
+  let last = "";
+  for (const i of VIEW) {
+    const label = dayLabel(ts.get(i) || 0);
+    if (label !== last) { it.push({ k: 2, html: secHTML(label) }); last = label; }
+    it.push({ k: 0, i, role: "hist", when: ts.get(i) || 0 });
+  }
+  HITEMS = it; ITEMS = new Int32Array(0);
+  VL.set(it.length, i => it[i].k, i => it[i].k === 0 ? trackRow(it[i].i, it[i]) : it[i].html, scrollTop);
+  headerEl.hidden = !it.length;
+  const msg = ROUTE.q ? `No played tracks match “${esc(ROUTE.q)}”.<br><button class="vb-btn" data-vb="searchall">Search all tracks</button>`
+    : "Nothing played yet.<br>Play a track and it shows up here, newest first.";
+  emptyEl.innerHTML = it.length ? "" : msg;
+  emptyEl.hidden = !!it.length;
+  viewbar();
+}
+
 function renderView(scrollTop = 0) {
   setHL(ROUTE.q);
   performance.mark('lib-first-view');
     $("loader").hidden = true;
   if (ROUTE.v === "queue") { renderQueue(scrollTop); return; }
+  if (ROUTE.v === "hist") { renderHist(scrollTop); return; }
   VIEW = listFor(ROUTE);
   HDR = new Map();
   const multi = VIEW.length > 1 && T[VIEW[0]].fi !== T[VIEW[VIEW.length - 1]].fi;   // grouped ⇒ endpoints differ
@@ -804,6 +957,7 @@ function viewbar() {
     btns = `<button class="vb-btn" data-vb="m3u"${CUR < 0 ? " disabled" : ""}>Save .m3u</button><button class="vb-btn" data-vb="clear"${Q.up.length ? "" : " disabled"}>Clear</button>`;
   } else {
     if (ROUTE.v === "fav") crumbs = `<span class="cur" title="Favorites">★ Favorites</span>`;
+    else if (ROUTE.v === "hist") crumbs = `<span class="cur" title="Play history">⟲ History</span>`;
     else {
       const chain = [];
       for (let n = ROUTE.f == null ? ROOTNODE : NODE_BY_PATH.get(ROUTE.f); n; n = n.parent) chain.unshift(n);
@@ -818,7 +972,8 @@ function viewbar() {
     meta = VIEW.length ? `${plural(VIEW.length, "track")} · ${fmtLong(secs)}${ROUTE.q ? ` · “${esc(ROUTE.q)}”` : ""}` : "";
     const off = VIEW.length ? "" : " disabled";
     btns = `<button class="vb-btn primary" data-vb="play" title="Play" aria-label="Play"${off}>▶<span class="vb-lbl"> Play</span></button>`
-      + `<button class="vb-btn" data-vb="shuffle" title="Shuffle" aria-label="Shuffle"${off}>${ICON.shuffle}<span class="vb-lbl"> Shuffle</span></button>`;
+      + `<button class="vb-btn" data-vb="shuffle" title="Shuffle" aria-label="Shuffle"${off}>${ICON.shuffle}<span class="vb-lbl"> Shuffle</span></button>`
+      + (ROUTE.v === "hist" ? `<button class="vb-btn" data-vb="clrhist"${HIST.length ? "" : " disabled"}>Clear history</button>` : "");
   }
   $("crumbs").innerHTML = crumbs; $("viewmeta").innerHTML = meta; $("viewbtns").innerHTML = btns;
 }
@@ -832,7 +987,7 @@ function trackRow(i, o) {
     + `<div class="t-artist" title="${esc(t.artist)}">${hl(t.artist)}</div>`
     + `<div class="t-album" title="${esc(t.album)}">${hl(t.album)}</div>`
     + `<button class="t-fav${fav ? " on" : ""}" data-act="fav" title="${fav ? "Remove from favorites" : "Add to favorites"}" aria-label="Favorite" aria-pressed="${fav}">${fav ? "★" : "☆"}</button>`
-    + `<div class="t-dur">${t.dur ? fmt(t.dur) : "–"}</div>`
+    + `<div class="t-dur">${o && o.when ? clockOf(o.when) : t.dur ? fmt(t.dur) : "–"}</div>`
     + (role === "up" ? `<button class="t-act" data-act="rm" title="Remove from queue" aria-label="Remove from queue">✕</button>`
                      : `<button class="t-act" data-act="more" title="More" aria-label="More actions">⋯</button>`)
     + `</div>`;
@@ -872,6 +1027,7 @@ function renderQueue(scrollTop = 0) {
 
 function itemIndexOf(i) {
   if (ROUTE.v === "queue") return QITEMS.findIndex(x => x.k === 0 && x.i === i);
+  if (ROUTE.v === "hist") return HITEMS.findIndex(x => x.k === 0 && x.i === i);
   return ITEMS.indexOf(i);
 }
 async function focusTrack(path, cue) {
@@ -932,7 +1088,7 @@ function setContext(rec, list, start, play) {
 function ctxLabel() {
   const r = Q.recipe;
   if (!r) return "";
-  const name = r.v === "fav" ? "Favorites" : r.f == null ? "All tracks" : (NODE_BY_PATH.get(r.f)?.name ?? r.f) || "Loose tracks";
+  const name = r.v === "fav" ? "Favorites" : r.v === "hist" ? "History" : r.f == null ? "All tracks" : (NODE_BY_PATH.get(r.f)?.name ?? r.f) || "Loose tracks";
   return r.q ? `${name} · “${r.q}”` : name;
 }
 const upcoming = () => Q.up.length + Math.max(0, Q.ctx.length - Q.pos - 1);
@@ -945,11 +1101,12 @@ function load(i, fromUp, play, at = 0) {
   }
   CUR = i; FROM_UP = fromUp; WANT = play; PENDING_SEEK = at;
   const el = spare();                                  // the idle element, usually already buffered
-  if (el.__i !== i) { el.__i = i; el.__warm = false; el.src = trackURL(i); }
+  if (el.__i !== i || el.__base !== BASE) { el.__i = i; el.__base = BASE; el.__warm = false; el.src = trackURL(i); }
   audio.pause();
   audio = el;
   applyRate(); applyVol();
   if (play) audio.play().catch(() => {});
+  if (play) recHistory(i);
   nowbar(); mediaMeta(); queueChanged();
   if (ROUTE.v !== "queue") VL.refresh();
   const k = itemIndexOf(i);
@@ -967,7 +1124,7 @@ function bufferNext() {
   const el = spare(), j = peekNext();
   if (j < 0 || j === CUR || !T[j]) return;             // unknown track (chunk not loaded): skip the pre-read
   el.__warm = false;
-  if (el.__i !== j) { el.__i = j; el.src = trackURL(j); }
+  if (el.__i !== j || el.__base !== BASE) { el.__i = j; el.__base = BASE; el.src = trackURL(j); }
   el.preload = "auto";
 }
 // Nothing loaded yet: pre-read one track of the current view, so the first click on
@@ -975,10 +1132,10 @@ function bufferNext() {
 function warmCandidate() {
   if (WANT || CUR >= 0 || !VIEW.length) return;
   const el = spare();
-  if (el.__warm && VIEW.includes(el.__i)) return;      // already holds a usable candidate
+  if (el.__warm && el.__base === BASE && VIEW.includes(el.__i)) return;   // already holds a usable candidate
   const j = VIEW[Math.floor(Math.random() * VIEW.length)];
   if (!T[j]) return;
-  el.__i = j; el.__warm = true; el.preload = "auto"; el.src = trackURL(j);
+  el.__i = j; el.__base = BASE; el.__warm = true; el.preload = "auto"; el.src = trackURL(j);
 }
 function warmStart(view) {                             // → a buffered candidate index, or -1
   const el = spare();
@@ -1070,7 +1227,7 @@ function queueChanged() {
 
 // ── Persistence ───────────────────────────────────────────────────────────
 const KEY_STATE = () => `mugal:${LIB}:state`, KEY_FAV = () => `mugal:${LIB}:fav`, KEY_PREFS = "mugal:prefs";
-const P = Object.assign({ font: 14, vol: 0.8, muted: false, repeat: 0, shuffle: false, tune: false, side: 260, theme: 'dark' }, store.get(KEY_PREFS, {}));
+const P = Object.assign({ font: 14, vol: 0.8, muted: false, repeat: 0, shuffle: false, tune: false, side: 260, theme: 'dark', libroot: "" }, store.get(KEY_PREFS, {}));
 if (store.get(KEY_PREFS) == null && typeof store.get("fontSize") === "number") P.font = store.get("fontSize");  // pre-15 setting
 P.font = Math.min(32, Math.max(9, P.font | 0 || 14)); P.vol = Math.min(1, Math.max(0, +P.vol || 0)); P.repeat = (P.repeat | 0) % 3;
 const savePrefs = () => store.set(KEY_PREFS, P);
@@ -1099,7 +1256,7 @@ function restoreState() {
   const idx = p => { const i = BY_PATH.get(p); if (i === undefined) missing++; return i; };
   Q.up = (Array.isArray(st.up) ? st.up : []).map(idx).filter(i => i !== undefined);
   const r = st.r && typeof st.r === "object" ? st.r : null;
-  if (r && (r.v === "fav" || r.v === "lib") && (r.f == null || NODE_BY_PATH.has(r.f))) {
+  if (r && (r.v === "fav" || r.v === "hist" || r.v === "lib") && (r.f == null || NODE_BY_PATH.has(r.f))) {
     Q.recipe = { v: r.v, f: r.v === "lib" ? r.f ?? null : null, q: String(r.q || "") };
     Q.base = Int32Array.from(listFor(Q.recipe));
     Q.sh = P.shuffle && st.sh && Number.isFinite(st.sh.seed)
@@ -1125,7 +1282,7 @@ function loadFavs() {
   if (FAVS_LOADED) return; FAVS_LOADED = true;       // favorites resolve through BY_PATH, so this needs the full index
   for (const p of store.get(KEY_FAV(), [])) { const i = BY_PATH.get(p); i === undefined ? FAV_LOST.push(p) : FAV.add(i); }
 }
-const saveFavs = () => store.set(KEY_FAV(), [...FAV].map(i => T[i].path).concat(FAV_LOST));
+const saveFavs = () => { store.set(KEY_FAV(), [...FAV].map(i => T[i].path).concat(FAV_LOST)); scheduleSync(); };
 const favList = () => Int32Array.from(FAV).sort();
 function setFav(idxs, on) {
   let n = 0;
@@ -1142,6 +1299,201 @@ function toggleFav(i) {
 function favChanged() {
   counts(); nowbar();
   if (ROUTE.v === "fav") renderView(scroller.scrollTop); else VL.refresh();
+}
+
+// ── Data files: favorites & history next to index.html ────────────────────
+// A file:// page has an opaque origin: it cannot fetch its own folder and cannot write to disk
+// unless the user grants a directory (File System Access API). So localStorage stays the live
+// store and these two files are a readable mirror — written automatically once a folder is
+// granted (the handle is kept in IndexedDB), otherwise saved/loaded from the settings panel.
+// .js rather than .json, so a plain <script src> can read it even from file://.
+const DATA_NAME = { fav: "favdata.js", hist: "historydata.js" };
+const FSA = typeof window.showDirectoryPicker === "function";
+let DIRH = null, SYNC_T = 0, SYNC_BUSY = false, SYNC_DONE = "";
+const favFileBody = () => "// Music player — favorites (paths relative to the library root)\nwindow.__MUGAL_FAV = "
+  + JSON.stringify([...FAV].map(i => T[i].path).concat(FAV_LOST)) + ";\n";
+const histFileBody = () => "// Music player — play history, newest first\nwindow.__MUGAL_HIST = "
+  + JSON.stringify(HIST) + ";\n";
+
+function idb() {
+  return new Promise((res, rej) => {
+    let r;
+    try { r = indexedDB.open("mugal-files", 1); } catch (e) { return rej(e); }
+    r.onupgradeneeded = () => { try { r.result.createObjectStore("kv"); } catch {} };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbGet(k) {
+  try { const db = await idb(); return await new Promise((res, rej) => { const q = db.transaction("kv").objectStore("kv").get(k); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); } catch { return undefined; }
+}
+async function idbSet(k, v) {
+  try { const db = await idb(); await new Promise((res, rej) => { const q = db.transaction("kv", "readwrite").objectStore("kv").put(v, k); q.onsuccess = () => res(); q.onerror = () => rej(q.error); }); } catch {}
+}
+function dataNote(msg) {
+  const el = $("data-info");
+  if (!el) return;
+  const mode = DIRH ? "writing to the player folder" : FSA ? "browser storage · no folder yet" : "browser storage · this browser can't write folders";
+
+  el.innerHTML = (msg ? esc(msg) + "<br>" : "") + `${plural(FAV.size + FAV_LOST.length, "favorite")} · ${fmtNum(HIST.length)} history · ${mode}`;
+}
+
+async function permit() {
+  if (!DIRH) return false;
+  try {
+    const q = await DIRH.queryPermission?.({ mode: "readwrite" });
+    return !q || q === "granted";
+  } catch { return false; }
+}
+async function writeData(now) {
+  if (!DIRH || SYNC_BUSY) return false;
+  SYNC_BUSY = true;
+  try {
+    if (!(await permit())) { dataNote("click Folder… once to re-allow writing"); return false; }
+    for (const [name, body] of [[DATA_NAME.fav, favFileBody()], [DATA_NAME.hist, histFileBody()]]) {
+      const fh = await DIRH.getFileHandle(name, { create: true });
+      const w = await fh.createWritable();
+      await w.write(new Blob([body], { type: "text/javascript" }));
+      await w.close();
+    }
+    SYNC_DONE = new Date().toLocaleTimeString();
+    dataNote(`saved ${DATA_NAME.fav} + ${DATA_NAME.hist} at ${SYNC_DONE}`);
+    return true;
+  } catch (e) {
+    dataNote("couldn't write the data files: " + (e.name || e.message));
+    return false;
+  } finally { SYNC_BUSY = false; }
+}
+function scheduleSync() {
+  if (!DIRH) { dataNote(); return; }
+  clearTimeout(SYNC_T);
+  SYNC_T = setTimeout(() => writeData(), 1200);
+}
+async function pickDataFolder() {
+  if (!FSA) { toast("This browser can't give a page folder access — use Save / Load instead"); return; }
+  let h;
+  try { h = await window.showDirectoryPicker({ id: "mugal-player", mode: "readwrite", startIn: "documents" }); }
+  catch (e) {
+    dataNote(e.name === "SecurityError" ? "this browser blocks folder access for file:// pages — use Save / Load" : "folder access was declined (" + e.name + ")");
+    toast("No folder granted");
+    return;
+  }
+  DIRH = h;
+  await idbSet("dir", h);
+  const ok = await writeData(true);
+  toast(ok ? `Writing ${DATA_NAME.fav} + ${DATA_NAME.hist} in “${h.name}”` : "That folder wouldn't take the files — use Save / Load");
+  closeSettings();
+}
+// Mirror files → the player: favorites go through BY_PATH (needs the full index), history is paths only.
+function applyFavPaths(paths) {
+  let n = 0;
+  for (const p of Array.isArray(paths) ? paths : []) {
+    if (typeof p !== "string") continue;
+    const i = BY_PATH.get(p);
+    if (i === undefined) { if (!FAV_LOST.includes(p)) { FAV_LOST.push(p); n++; } }
+    else if (!FAV.has(i)) { FAV.add(i); n++; }
+  }
+  if (n) { saveFavs(); favChanged(); }
+  return n;
+}
+function applyHistRows(rows) {
+  if (!Array.isArray(rows)) return 0;
+  const seen = new Set(HIST.map(x => x.p));
+  let n = 0;
+  for (const r of rows) {
+    if (!r || typeof r.p !== "string" || seen.has(r.p)) continue;
+    seen.add(r.p);
+    HIST.push({ p: r.p, t: Number.isFinite(r.t) ? r.t : 0 });
+    n++;
+  }
+  HIST.sort((a, b) => b.t - a.t);
+  if (HIST.length > HIST_MAX) HIST.length = HIST_MAX;
+  if (n) { saveHist(); histChanged(); scheduleSync(); }
+  return n;
+}
+// Pull the array literal that follows a marker, ignoring brackets inside strings.
+function grabArray(text, marker) {
+  const k = text.indexOf(marker);
+  if (k < 0) return null;
+  const from = text.indexOf("[", k);
+  if (from < 0) return null;
+  let depth = 0, inStr = false, q = "";
+  for (let i = from; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) { if (c === "\\") i++; else if (c === q) inStr = false; continue; }
+    if (c === '"' || c === "'") { inStr = true; q = c; continue; }
+    if (c === "[") depth++;
+    else if (c === "]" && --depth === 0) {
+      try { return JSON.parse(text.slice(from, i + 1)); } catch { return null; }
+    }
+  }
+  return null;
+}
+function importDataText(text, silent) {
+  let fav = grabArray(text, "__MUGAL_FAV"), hist = grabArray(text, "__MUGAL_HIST");
+  if (!fav && !hist) {                                       // a bare JSON file: {fav:[…], history:[…]}
+    try { const o = JSON.parse(text); if (o && typeof o === "object") { fav = o.fav || o.favorites || null; hist = o.hist || o.history || null; } } catch {}
+  }
+  const n = (fav ? applyFavPaths(fav) : 0) + (hist ? applyHistRows(hist) : 0);
+  if (!silent) toast(n ? `Loaded ${plural(n, "entry")}` : "Nothing new in that file");
+  return n ? { fav, hist } : null;
+}
+async function pullData() {                                  // read the mirror back from the granted folder
+  if (!DIRH || !(await permit())) return 0;
+  let n = 0;
+  for (const name of [DATA_NAME.fav, DATA_NAME.hist]) {
+    try { const f = await (await DIRH.getFileHandle(name)).getFile(); n += importDataText(await f.text(), true) ? 1 : 0; } catch {}
+  }
+  dataNote();
+  return n;
+}
+async function initDataFiles() {
+  dataNote();
+  DIRH = (await idbGet("dir")) || null;
+  if (!DIRH) { restoreFromFiles(); return; }
+  const got = await pullData();
+  if (got) { resolveLost(); toast("Favorites and history loaded from the player folder"); }
+  await writeData();
+}
+// No folder handle: the mirror files can still be read with a plain <script src> (that works on
+// file:// where fetch() does not). Only when browser storage is empty, so a stale file can never
+// resurrect a favorite you removed here.
+function loadScript(src) {
+  return new Promise(res => {
+    const s = document.createElement("script");
+    s.src = src + "?v=" + Date.now();
+    s.onload = () => res(true);
+    s.onerror = () => { s.remove(); res(false); };
+    document.head.appendChild(s);
+  });
+}
+async function restoreFromFiles() {
+  if (FAV.size || FAV_LOST.length || HIST.length) return false;
+  let got = false;
+  if (await loadScript(DATA_NAME.fav) && Array.isArray(window.__MUGAL_FAV)) got = applyFavPaths(window.__MUGAL_FAV) > 0 || got;
+  if (await loadScript(DATA_NAME.hist) && Array.isArray(window.__MUGAL_HIST)) got = applyHistRows(window.__MUGAL_HIST) > 0 || got;
+  if (got) { resolveLost(); toast("Favorites and history restored from files beside index.html"); }
+  dataNote();
+  return got;
+}
+function saveDataFiles() {
+  const dl = (name, body) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([body], { type: "text/javascript" }));
+    a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  };
+  dl(DATA_NAME.fav, favFileBody());
+  setTimeout(() => dl(DATA_NAME.hist, histFileBody()), 500);
+  toast(`Saving ${DATA_NAME.fav} / ${DATA_NAME.hist} — keep them beside index.html`);
+}
+// A favorite that was in the file but not in the index yet (chunk still loading) gets a second chance.
+function resolveLost() {
+  if (!FAV_LOST.length) return;
+  const rest = [];
+  for (const p of FAV_LOST) { const i = BY_PATH.get(p); i === undefined ? rest.push(p) : FAV.add(i); }
+  if (rest.length !== FAV_LOST.length) { FAV_LOST = rest; saveFavs(); favChanged(); }
 }
 
 // ── Now playing, modes, counts ────────────────────────────────────────────
@@ -1174,6 +1526,7 @@ function counts() {
   $("cnt-queue").textContent = n ? fmtNum(n) : "";
   $("q-badge").textContent = n ? (n > 999 ? "999+" : n) : "";
   $("cnt-fav").textContent = FAV.size ? fmtNum(FAV.size) : "";
+  $("cnt-hist").textContent = HIST.length ? fmtNum(HIST.length) : "";
 }
 function applyRate() {
   const r = P.tune ? TUNE_RATE : 1;
@@ -1214,13 +1567,24 @@ function hook(el) {
     if (el !== audio) return;
     $("btn-play").textContent = "▶"; $("btn-play").setAttribute("aria-label", "Play"); $("btn-play").title = "Play (Space)"; nowbar(); VL.refresh(); saveState();
   });
-  el.addEventListener("playing", () => { if (el === audio) FAILS = 0; });
+  el.addEventListener("playing", () => { if (el === audio) { FAILS = 0; PLAYED_OK = true; } });
   el.addEventListener("ended", () => { if (el === audio) next(true); });
   el.addEventListener("ratechange", () => { if (el === audio) mediaPos(); });
   el.addEventListener("seeked", () => { if (el === audio) mediaPos(); });
   el.addEventListener("error", () => {
     if (el !== audio || CUR < 0 || !audio.getAttribute("src")) return;
-    const why = { 2: "network error", 3: "can't decode it", 4: "file missing or format not supported" }[audio.error?.code] || "can't play it";
+    const code = audio.error?.code;
+    // Nothing has played yet and the relative base points nowhere: the player folder was moved
+    // away from the library. Try the library path from the data file once before skipping.
+    if (!PLAYED_OK && !BASE_RETRY && !BASE_USER && BASE_ROOT && BASE !== BASE_ROOT && (code === 2 || code === 4)) {
+      BASE_RETRY = true;
+      setBase(BASE_ROOT, "player folder moved out of the library");
+      audio.__base = BASE;
+      audio.src = trackURL(CUR);
+      if (WANT) audio.play().catch(() => {});
+      return;
+    }
+    const why = { 2: "network error", 3: "can't decode it", 4: "file missing or format not supported" }[code] || "can't play it";
     const t = T[CUR];
     if (!WANT) { toast(`Can't load “${t.title}” — ${why}`); return; }
     if (++FAILS >= 5) { WANT = false; toast(`Stopped: ${FAILS} tracks in a row couldn't be played`); return; }
@@ -1310,6 +1674,7 @@ $("viewbar").addEventListener("click", e => {
   if (v === "shuffle" && VIEW.length) { if (!P.shuffle) { P.shuffle = true; savePrefs(); modesUI(); } setContext(recipe(), VIEW, warmStart(VIEW), true); }
   if (v === "m3u") exportM3U(queueList(), "queue");
   if (v === "clear") clearUp();
+  if (v === "clrhist") clearHist();
 });
 emptyEl.addEventListener("click", e => { if (e.target.closest('[data-vb="searchall"]')) navigate({ v: "lib", q: ROUTE.q }); });
 
@@ -1326,6 +1691,7 @@ $("nav").addEventListener("click", e => {
   const nv = e.target.closest(".nv");
   if (!nv) return;
   if (nv.dataset.nav === "queue") navigate({ v: "queue" });
+  else if (nv.dataset.nav === "hist") navigate({ v: "hist", q: ROUTE.v === "hist" ? ROUTE.q : "" });
   else navigate({ v: "fav", q: ROUTE.v === "fav" ? ROUTE.q : "" });
 });
 $("logo").addEventListener("click", () => navigate({ v: "lib" }));
@@ -1542,6 +1908,15 @@ async function importM3U(file) {
 }
 $("btn-import").addEventListener("click", () => $("file-import").click());
 $("file-import").addEventListener("change", e => { const f = e.target.files[0]; if (f) importM3U(f); e.target.value = ""; closeSettings(); });
+$("btn-data-dir").addEventListener("click", pickDataFolder);
+$("btn-data-save").addEventListener("click", () => { saveState(); saveDataFiles(); });
+$("btn-data-load").addEventListener("click", () => $("file-data").click());
+$("file-data").addEventListener("change", async e => {
+  const f = e.target.files[0]; e.target.value = "";
+  if (!f) return;
+  try { importDataText(await f.text()); } catch { toast("Couldn't read that file"); }
+  closeSettings();
+});
 
 // ── Drag & drop: tracks/folders → Queue/Favorites, reorder "Next up", drop .m3u files ─
 let DRAG = null, fileDrag = 0;
@@ -1559,7 +1934,7 @@ document.addEventListener("dragstart", e => {
 });
 function dropTarget(e) {
   const nv = e.target.closest?.(".nv[data-nav]");
-  if (nv) return { kind: nv.dataset.nav, el: nv, cls: "drop" };
+  if (nv && nv.dataset.nav !== "hist") return { kind: nv.dataset.nav, el: nv, cls: "drop" };
   if (ROUTE.v !== "queue") return null;
   const tr = e.target.closest?.('#vl-rows .tr[data-role="up"]');
   if (tr) { const r = tr.getBoundingClientRect(), after = e.clientY > r.top + r.height / 2; return { kind: "up", at: +tr.dataset.q + (after ? 1 : 0), el: tr, cls: after ? "drop-after" : "drop-before" }; }
@@ -1627,7 +2002,30 @@ document.addEventListener("keydown", e => {
 
 // ── Settings, sidebar, font size, resizer ─────────────────────────────────
 const closeSettings = () => $("settingspop").classList.remove("open");
-$("settingsbtn").addEventListener("click", e => { e.stopPropagation(); $("settingspop").classList.toggle("open"); });
+$("settingsbtn").addEventListener("click", e => { e.stopPropagation(); $("settingspop").classList.toggle("open"); dataNote(); rootUI(); });
+$("btn-root-set").addEventListener("click", () => {
+  const u = toBaseURL($("root-input").value);
+  if (!u) return toast("That doesn't look like a folder");
+  P.libroot = u; savePrefs();
+  BASE_USER = u;
+  const moved = setBase(u, "set in settings");
+  rootUI();
+  toast(moved ? "Library folder: " + deURL(u) : "Library folder saved");
+});
+$("btn-root-auto").addEventListener("click", () => {
+  P.libroot = ""; savePrefs();
+  BASE_USER = "";
+  setBase(BASE_AUTO, "back to automatic");
+  rootUI();
+  toast("Library folder: automatic");
+});
+function rootUI() {
+  const el = $("root-input"), note = $("root-info");
+  if (!el) return;
+  if (document.activeElement !== el) el.value = deURL(BASE);
+  const how = BASE_USER ? "set here" : BASE === BASE_ROOT ? "from the library path in audiodata.js" : "relative to this page (../)";
+  note.innerHTML = `Reading audio and covers from <code>${esc(BASE)}</code> — ${how}`;
+}
 document.addEventListener("click", e => { if (!$("settingspop").contains(e.target) && e.target !== $("settingsbtn")) closeSettings(); });
 $("btn-reload").addEventListener("click", () => { saveState(); location.reload(); });
 $("btn-help").addEventListener("click", () => { closeSettings(); showHelp(); });
@@ -1703,11 +2101,14 @@ function boot() {
   if (r.t) replaceHash(hashOf({ ...r, t: null }));
   const later = () => setTimeout(hydrate, 600);
   applyRoute(r, { cue: true }).then(later, later);
+  loadHist();
   counts(); nowbar();
   const d = new Date((META.generated || 0) * 1000);
   $("lib-info").textContent = `${plural(T.length, "track")} · ${plural(FOLDERS.length, "folder")} · scanned ${d.toLocaleString()} · v${META.version}`;
   setTimeout(warmCandidate, 0);          // pre-open one track so the first click isn't cold
   setTimeout(warmCandidate, 1500);
+  setTimeout(probeBase, 1500);           // the player folder may have moved: check the relative base
+  setTimeout(initDataFiles, 300);        // favorite/history mirror in the player folder (if granted)
 }
 // No deep link: reopen the view that was last used, so a folder library starts on its chunk
 // instead of pulling all 138k track rows first. Falls back to "All tracks" as before.
@@ -1716,6 +2117,7 @@ function lastRoute() {
   if (!st || st.v !== 1 || !st.r || typeof st.r !== "object") return null;
   const v = st.r.v;
   if (v === "fav") return { v: "fav", f: null, q: "", t: null };
+  if (v === "hist") return { v: "hist", f: null, q: "", t: null };
   if (v !== "lib") return null;
   const f = st.r.f ?? null;
   if (f != null && !NODE_BY_PATH.has(f)) return null;
@@ -1751,10 +2153,12 @@ function afterAll() {
   if (HYDRATED) return; HYDRATED = true;
   performance.mark('lib-hydrated');
   loadFavs();
+  resolveLost();                                       // paths that arrived before the index was full
   restoreState();
   HAY = null;
   counts(); nowbar();
-  if (ROUTE.v === "fav" || ROUTE.v === "queue") renderView(scroller.scrollTop); else { VL.refresh(); renderTree(); }
+  dataNote();
+  if (ROUTE.v === "fav" || ROUTE.v === "hist" || ROUTE.v === "queue") renderView(scroller.scrollTop); else { VL.refresh(); renderTree(); }
 }
 document.addEventListener("DOMContentLoaded", boot);
 </script>

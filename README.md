@@ -99,6 +99,7 @@ uv run https://raw.githubusercontent.com/glowinthedark/432-hz-music-player/refs/
 
 - `index.html`: the player (no external dependencies)
 - `audiodata.js`: compact track data (≈ 100 bytes per track; 100k tracks ≈ 10 MB). Optionally split into a manifest + `audiodata.0.js` … chunks by `split-data.py` (see below)
+- `favdata.js`, `historydata.js`: optional, written *by the player* (not by mugal) — favorites and play history as plain paths, see "Favorites and play history as files" below
 - `.mugal/`: scan cache, `scan-report.txt` (unreadable files, skipped folders), covers extracted from read-only folders. If OUTPUT isn't writable, the cache and report go to the user cache folder instead (`$XDG_CACHE_HOME/mugal`, else `~/Library/Caches/mugal` on macOS, `~/.cache/mugal` on Linux, `%LOCALAPPDATA%\mugal\Cache` on Windows), so rescans stay fast
 
 Files are replaced atomically (temp file + rename). If only the files themselves are writable, not their folder (e.g. write permission granted on `audiodata.js` alone), they're overwritten in place instead; `index.html` isn't rewritten when it's already current. If `audiodata.js` can't be written at all, mugal stops before scanning and suggests `-o DIR`.
@@ -160,6 +161,58 @@ Practical notes:
 
 - `--self-update` compares `player.html` with the upstream copy and may replace it; a copy of the chunk-aware player is kept at `.mugal/player-chunked-backup.html` in the output folder of this setup. The `<meta name="mugal-template">` date is what decides, so bump it if you edit the player.
 - The chunked layout is produced by `split-data.py`, not by `mugal.py`. If you re-scan and skip the extra step you simply get the old one-file behaviour.
+
+### 3. Favorites and play history as files
+
+New sidebar entry **History** (`#history`): everything you played, newest first, grouped by day (*Today*, *Yesterday*, weekday, date) with the time of each play on the right, one row per track (replaying moves it back to the top instead of listing it twice). 500 entries are kept; search, *Play*, *Shuffle* and *Clear history* work like the other views.
+
+Favorites already lived in `localStorage`. Both are now mirrored to two files **next to `index.html`** so they survive a cleared browser profile, another browser, or a copy of the folder:
+
+```js
+// favdata.js        — paths relative to the library root
+window.__MUGAL_FAV = ["Rock/Album/01 track.flac", …];
+
+// historydata.js    — newest first, t = ms timestamp
+window.__MUGAL_HIST = [{"p":"Rock/Album/01 track.flac","t":1795605556149}, …];
+```
+
+They are `.js`, not `.json`, on purpose: a `file://` page may load a `<script>` but cannot `fetch()` a local file, so `.js` is the only format the player can read itself.
+
+Writing them is where browser policy shows up. A `file://` page has an opaque origin: it cannot write to disk unless the user grants a folder once. So **Settings → Favorites & history files**:
+
+| Control | What it does |
+|---|---|
+| `Folder…` | Asks for the player folder once (File System Access API). If granted, the handle is kept in IndexedDB and both files are rewritten ≈1.2 s after every change, and read back at startup. If the browser refuses (some Chrome builds do for `file://`), use the two buttons below. |
+| `Save` | Downloads `favdata.js` + `historydata.js`; put them beside `index.html`. One click per save. |
+| `Load…` | Picks such a file and merges its contents in (both formats are understood: the `.js` above, or `{"fav":[…],"history":[…]}` JSON). |
+
+Startup behaviour: the files are read **only when browser storage is empty**, so an old file can never resurrect a favorite you removed here. With a granted folder the files are treated as the live mirror and always read.
+
+Because entries are stored as library-relative paths, moving the player folder (below) or opening the library from a different drive letter does not lose favorites or history.
+
+### 4. Move the player folder away from the library
+
+`mugal.py` writes `base: "../"` — relative to the folder `index.html` was generated in — and prepends the same prefix to cover-art paths. Keep the player beside the library and that is correct; copy the player folder somewhere else (another drive, a USB stick, a `C:\Tools` folder) and audio *and* covers point at nothing.
+
+The data file also records `root`, the library path the scan used, so the player can re-derive where the files are:
+
+- at startup one cover is loaded through the current base; if it fails, the player switches to `root` and says so once (`Library: \\nas\share\music`);
+- if nothing has played yet and the first track fails to load, the same retry happens before any track is skipped;
+- covers are rebuilt from the same base, so they come back too (art paths are stored root-relative now).
+
+Verified with Chrome: a `file:///C:/…` page loads audio and images from `file:///D:/…` and from a network share (`file://server/share/…`), so no server is needed — double-clicking `index.html` from the new location is enough.
+
+**Settings → Library folder** pins it by hand when the automatic probe cannot tell (for example a library with no cover art at all):
+
+```
+D:\Media\file\music          → file:///D:/Media/file/music/
+\\nas\share\music            → file://nas/share/music/
+file:///D:/Media/file/music  → used as-is
+```
+
+`Use` stores it in the preferences (`libroot`) and it wins over the probe at every start; `Auto` removes it and goes back to `../` plus the probe. Keep the player on `file://`: an `http(s)` page is not allowed to load `file://` media, so serving the player would break a library that lives on disk.
+
+Nothing else depends on the player's location: `audiodata*.js`, `favdata.js` and `historydata.js` all live beside `index.html` and travel with the folder, and the `localStorage` namespace is keyed on the *library* path, not on the player.
 
 ## Requirements
 
